@@ -2,8 +2,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.cluster import KMeans
-from sklearn.metrics import adjusted_rand_score
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
 from torch.nn import TransformerEncoderLayer, TransformerEncoder
 from torch_geometric.nn import GATConv
 from torchvision import models
@@ -67,6 +67,72 @@ def evaluate_clustering_on_validation( dataloader,model,device):
     avg_ari = np.mean(ari_list)
     return avg_ari
 
+
+def cluster_and_score_p(embeddings: torch.Tensor, true_labels: list[int], B) -> float:
+    """
+    Perform HDBSCAN clustering and compute clustering accuracy via ARI.
+
+    Args:
+        embeddings (torch.Tensor): Tensor of shape [N, D], patch embeddings.
+        true_labels (List[int]): Ground-truth image indices for each patch.
+
+    Returns:
+        ari (float): Adjusted Rand Index between predicted and true labels.
+    """
+    embeddings_np = embeddings.detach().cpu().numpy()
+    clusterer = AgglomerativeClustering(n_clusters=B)
+    # clusterer = SpectralClustering(n_clusters=B, affinity='nearest_neighbors', assign_labels='kmeans')
+    pred_labels = clusterer.fit_predict(embeddings_np)
+    true_labels = np.array(true_labels)
+    # print("true_labels ", true_labels)
+    # print("pred_labels ", pred_labels)
+    ari = adjusted_rand_score(true_labels, pred_labels)
+    nmi = normalized_mutual_info_score(true_labels, pred_labels)
+    silhouette = silhouette_score(embeddings_np, pred_labels)
+
+    return ari, nmi, silhouette
+
+
+def evaluate_clustering_on_validation_p(dataloader, model, device):
+    """
+    Evaluate clustering performance on validation set.
+    Args:
+        :param dataloader (DataLoader): DataLoader for validation set.
+        :param model (nn.Module): Trained model for generating embeddings
+        :param device:
+    """
+    ari_list, nmi_list, sil_list = [], [], []
+    for batch, labels in dataloader:
+        batch = batch.to(device)
+        with torch.no_grad():
+            B, N, C, H, W = batch.shape
+
+            # reshape to [B*N, C, H, W]
+
+            true_labels = labels.numpy().repeat(N)
+            # print("true_labels ", true_labels)
+            batch = batch.view(B * N, C, H, W)
+
+            # Get embeddings
+            embeddings = model(batch)
+
+            # embeddings = embeddings.view(-1, embeddings.shape[-1])
+            # print(embeddings.shape)
+            # Compute ARI
+            ari, nmi, sil = cluster_and_score_p(embeddings, true_labels, B)
+            ari_list.append(ari)
+            nmi_list.append(nmi)
+            sil_list.append(sil)
+            # print(f"Adjusted Rand Index (ARI): {ari:.4f}")
+
+    # Average ARI over all batches
+    avg_ari = np.mean(ari_list)
+    avg_nmi = np.mean(nmi_list)
+    avg_sil = np.mean(sil_list)
+
+    return avg_ari, avg_nmi, avg_sil
+
+
 def create_patch_graph(embeddings, top_k=5):
     """
     embeddings: Tensor [num_patches, embed_dim]
@@ -87,7 +153,7 @@ class GATPatchCluster(nn.Module):
         super().__init__()
 
         # CNN Backbone (ResNet18)
-        backbone = models.resnet18(weights='IMAGENET1K_V1')
+        backbone = models.resnet18(weights=None)
         self.encoder = nn.Sequential(*list(backbone.children())[:-2])  # [B*N, 512, H', W']
         self.fc = nn.Linear(512, embed_dim)
         self.top_k = top_k
@@ -166,7 +232,7 @@ class TransformerPatchCluster(nn.Module):
         super().__init__()
 
         # CNN Backbone (ResNet18)
-        backbone = models.resnet18(weights='IMAGENET1K_V1')
+        backbone = models.resnet18(weights=None)
         self.encoder = nn.Sequential(*list(backbone.children())[:-2])  # [B*N, 512, H', W']
         self.fc = nn.Linear(512, embed_dim)  # Project to transformer input dim
 
@@ -187,6 +253,7 @@ class TransformerPatchCluster(nn.Module):
 
     def train_model(self, train_loader, val_loader,
                     optimizer, scheduler, device, epochs=10, temperature=0.5):
+        val_losses = [0]
         for epoch in range(epochs):
             self.train()
             total_loss = 0
@@ -196,6 +263,7 @@ class TransformerPatchCluster(nn.Module):
                 labels = torch.arange(B).repeat_interleave(N).to(device)
 
                 embeddings = self.forward(batch)
+                #print(embeddings.shape)
 
                 loss = supervised_nt_xent_loss(embeddings, labels, temperature=temperature)
 
@@ -213,7 +281,24 @@ class TransformerPatchCluster(nn.Module):
                 avg_ari = evaluate_clustering_on_validation(val_loader, self, device=device)
                 print(f"Epoch [{epoch + 1}/{epochs}], ARI: {avg_ari:.4f}")
                 scheduler.step(avg_ari)
+
+                # Save the model if ARI improves
+                if avg_ari > max(val_losses):
+                    torch.save(self.state_dict(), f"best_model_epoch_{epoch + 1}.pth")
+                    print(f"Model saved at epoch {epoch + 1} with ARI: {avg_ari:.4f}")
+                val_losses.append(avg_ari)
                 print("Current learning rate:", scheduler.get_last_lr())
+
+        return val_losses[1:]  # Exclude the initial value
+    def load_weights(self, path):
+        """
+        Load model weights from a file.
+        Args:
+            path (str): Path to the weights file.
+        """
+        self.load_state_dict(torch.load(path, map_location=self.device))
+        print(f"Weights loaded from {path}")
+
 
     def __call__(self, x):
 
@@ -228,7 +313,7 @@ class GATPatchClusterVIT(nn.Module):
         self.device = device
 
         # Load pretrained ViT
-        vit = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        vit = vit_b_16(weights=None)
 
         # Extract the patch embedding and encoder part (no classification head)
         self.vit_conv_proj = vit.conv_proj          # Patch projection
@@ -275,6 +360,7 @@ class GATPatchClusterVIT(nn.Module):
         return self.forward(x, edge_index)
 
     def train_model(self, train_loader, val_loader, optimizer, scheduler, device, epochs=10,temperature=0.5):
+        val_losses = []
         for epoch in range(epochs):
             self.train()
             total_loss = 0
@@ -309,17 +395,25 @@ class GATPatchClusterVIT(nn.Module):
 
             # Validation
             self.eval()
+
             with torch.no_grad():
                 avg_ari = evaluate_clustering_on_validation(val_loader, self, device=device)
                 print(f"Epoch [{epoch + 1}/{epochs}], ARI: {avg_ari:.4f}")
                 scheduler.step(avg_ari)
+                val_losses.append(avg_ari)
+                # Save the model if ARI improves
+                if avg_ari > max(val_losses):
+                    torch.save(self.state_dict(), f"best_model_epoch_{epoch + 1}.pth")
+                    print(f"Model saved at epoch {epoch + 1} with ARI: {avg_ari:.4f}")
+
                 print("Current LR:", scheduler.get_last_lr())
+        return val_losses
 
 
 class ViTPatchEmbedder(nn.Module):
     def __init__(self):
         super().__init__()
-        vit = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        vit = vit_b_16(weights=None)
 
         # Extract patch embedding and transformer encoder
         self.vit_conv_proj = vit.conv_proj        # [B, 768, 14, 14]

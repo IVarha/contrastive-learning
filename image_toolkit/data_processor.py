@@ -10,7 +10,8 @@ from tqdm import tqdm
 
 
 class FragmentDataset(Dataset):
-    def __init__(self, root,limit=None,image_size=64, patch_size=16, fragments_per_image=16):
+    def __init__(self, root,limit=None,image_size=64,
+                 patch_size=16, fragments_per_image=16, augment=False,augmenter = None):
 
         self.images = []#[Image.open(x).convert("RGB") for x in Path(root).glob("*.png")]
         i = 0
@@ -22,11 +23,23 @@ class FragmentDataset(Dataset):
         self.patch_size = patch_size
         self.image_size = image_size
         self.fragments_per_image = fragments_per_image
+        self.augment = augment
+        self.augmenter = augmenter
         #self.files = list(Path(root).glob("*.png"))  # or '*.jpg'
         self.transform = T.Compose([
             T.Resize((self.image_size, self.image_size)),
             T.ToTensor()
         ])
+
+    def get_full_image(self, idx):
+        img = self.images[idx]
+        try:
+            img = self.transform(img)
+        except Exception as e:
+            print(f"Error transforming image {idx}: {e}")
+            print(f"Image shape: {img.size}")
+        return img
+
 
     def __len__(self):
         return len(self.images)
@@ -55,6 +68,14 @@ class FragmentDataset(Dataset):
 
         for (i, j) in selected_positions:
             fragment = img[:, i:i+self.patch_size, j:j+self.patch_size]
+            # Apply augmentation if specified
+            if self.augment:
+                if self.augmenter is not None:
+                    try:
+                        fragment = self.augmenter(fragment)
+                    except Exception as e:
+                        print(f"Error applying augmenter to fragment {idx}: {e}")
+                        print(f"Fragment shape: {fragment.shape}")
             fragments.append(fragment)
         try:
             fragments = torch.stack(fragments)
