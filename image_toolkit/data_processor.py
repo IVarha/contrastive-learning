@@ -1,4 +1,3 @@
-import torch
 import random
 from pathlib import Path
 
@@ -45,6 +44,8 @@ class FragmentDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
+        if isinstance(idx, list): # If idx is a list, return a list of items
+            return [self.__getitem__(i) for i in idx]
         img = self.images[idx]
         try:
             img = self.transform(img)
@@ -85,3 +86,6 @@ class FragmentDataset(Dataset):
 
             # If stacking fails, return empty tensor
         return fragments, idx  # synthetic label
+
+    def __getitems__(self, indices):
+        return [self.__getitem__(i) for i in indices]
